@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -33,7 +33,10 @@ CREATE TABLE IF NOT EXISTS evidence_protocol_catalog (
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
+    role TEXT NOT NULL CHECK (role IN (
+        'operator', 'statistician', 'approver', 'auditor',
+        'initial_reviewer', 'specialist', 'final_reviewer'
+    )),
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
 
@@ -148,6 +151,70 @@ CREATE TABLE IF NOT EXISTS decisions (
     UNIQUE (batch_id, analysis_id)
 );
 
+CREATE TABLE IF NOT EXISTS specimens (
+    specimen_id TEXT PRIMARY KEY,
+    catalog_number TEXT NOT NULL UNIQUE,
+    common_name TEXT NOT NULL,
+    collected_at TEXT,
+    location TEXT,
+    registered_by TEXT NOT NULL REFERENCES users(user_id),
+    registered_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS specimen_evidence (
+    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    specimen_id TEXT NOT NULL REFERENCES specimens(specimen_id),
+    evidence_type TEXT NOT NULL CHECK (evidence_type IN ('material', 'analysis_batch', 'type_photo')),
+    external_ref TEXT NOT NULL,
+    description TEXT NOT NULL,
+    content_sha256 TEXT CHECK (content_sha256 IS NULL OR length(content_sha256) = 64),
+    status TEXT NOT NULL CHECK (status IN ('active', 'withdrawn')),
+    registered_by TEXT NOT NULL REFERENCES users(user_id),
+    registered_at TEXT NOT NULL,
+    withdrawn_by TEXT REFERENCES users(user_id),
+    withdrawn_at TEXT,
+    withdraw_reason TEXT,
+    UNIQUE (specimen_id, evidence_type, external_ref)
+);
+
+CREATE TABLE IF NOT EXISTS determination_drafts (
+    draft_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    specimen_id TEXT NOT NULL REFERENCES specimens(specimen_id),
+    version_no INTEGER NOT NULL CHECK (version_no > 0),
+    scientific_name TEXT NOT NULL,
+    determination_basis TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    disclosures_json TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL CHECK (state IN ('in_review', 'published', 'invalidated')),
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    invalidated_at TEXT,
+    invalidation_reason TEXT,
+    UNIQUE (specimen_id, version_no)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_current_determination_per_specimen
+ON determination_drafts(specimen_id)
+WHERE state = 'published';
+
+CREATE TABLE IF NOT EXISTS draft_citations (
+    draft_id INTEGER NOT NULL REFERENCES determination_drafts(draft_id),
+    evidence_id INTEGER NOT NULL REFERENCES specimen_evidence(evidence_id),
+    cited_at TEXT NOT NULL,
+    PRIMARY KEY (draft_id, evidence_id)
+);
+
+CREATE TABLE IF NOT EXISTS draft_signoffs (
+    signoff_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES determination_drafts(draft_id),
+    stage TEXT NOT NULL CHECK (stage IN ('initial', 'specialist', 'final')),
+    signer_id TEXT NOT NULL REFERENCES users(user_id),
+    comment TEXT NOT NULL,
+    signed_at TEXT NOT NULL,
+    UNIQUE (draft_id, stage)
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -163,6 +230,7 @@ REQUIRED_TABLES = frozenset({
     "schema_meta", "evidence_protocol_catalog", "users", "capture_devices", "builds", "batches",
     "evidence_items", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
+    "specimens", "specimen_evidence", "determination_drafts", "draft_citations", "draft_signoffs",
 })
 
 

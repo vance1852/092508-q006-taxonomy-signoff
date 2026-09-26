@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
-from .errors import ServiceError, ValidationFailed
+from .errors import PublishBlocked, ServiceError, ValidationFailed
 from .service import TaxonomyLabService
 from .storage import connect
 
@@ -133,9 +133,47 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            if method == "POST" and path == "/specimens":
+                result = self.service.register_specimen(
+                    self._actor(normalized_headers), payload["specimen_id"], payload["catalog_number"],
+                    payload["common_name"], payload.get("collected_at"), payload.get("location"),
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "specimens" and parts[2] == "evidence":
+                result = self.service.register_specimen_evidence(
+                    self._actor(normalized_headers), parts[1], payload["evidence_type"],
+                    payload["external_ref"], payload["description"], payload.get("content_sha256"),
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "evidence" and parts[2] == "withdraw":
+                result = self.service.withdraw_specimen_evidence(
+                    self._actor(normalized_headers), int(parts[1]), payload["reason"]
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "specimens" and parts[2] == "determination_drafts":
+                result = self.service.create_determination_draft(
+                    self._actor(normalized_headers), parts[1], payload["scientific_name"],
+                    payload["determination_basis"], payload.get("evidence_ids", []),
+                    payload.get("disclosures", []),
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "determinations" and parts[2] == "sign":
+                result = self.service.sign_determination(
+                    self._actor(normalized_headers), int(parts[1]), payload["comment"]
+                )
+                return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "specimens" and parts[2] == "determination":
+                return Response(200, self.service.current_determination(parts[1]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "specimens" and parts[2] == "determinations":
+                return Response(200, self.service.determination_history(self._actor(normalized_headers), parts[1]))
+            if method == "GET" and len(parts) == 2 and parts[0] == "determinations":
+                return Response(200, self.service.get_determination_draft(self._actor(normalized_headers), int(parts[1])))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            body: dict[str, Any] = {"error": {"code": exc.code, "message": str(exc)}}
+            if isinstance(exc, PublishBlocked):
+                body["error"]["reasons"] = exc.reasons
+            return Response(exc.status, body)
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
