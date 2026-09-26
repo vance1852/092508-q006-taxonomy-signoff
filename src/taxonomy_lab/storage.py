@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS evidence_protocol_catalog (
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
+    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'initial_reviewer', 'specialist_reviewer', 'final_reviewer')),
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
 
@@ -157,19 +157,129 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS specimens (
+    specimen_id TEXT PRIMARY KEY,
+    catalog_code TEXT NOT NULL,
+    taxon_group TEXT NOT NULL,
+    registered_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE (catalog_code)
+);
+
+-- 三类外部证据：初鉴形态记录、分子分析批次、模式照片。状态机 active <-> withdrawn。
+CREATE TABLE IF NOT EXISTS specimen_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    specimen_id TEXT NOT NULL REFERENCES specimens(specimen_id),
+    evidence_kind TEXT NOT NULL CHECK (evidence_kind IN ('initial_identification', 'molecular_batch', 'type_photograph')),
+    title TEXT NOT NULL,
+    -- 对分子证据可登记 taxonomy_lab.analyses 的内容摘要，便于跨批次核对
+    analysis_sha256 TEXT CHECK (analysis_sha256 IS NULL OR length(analysis_sha256) = 64),
+    provided_by TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'withdrawn')),
+    withdrawn_reason TEXT,
+    withdrawn_by TEXT REFERENCES users(user_id),
+    withdrawn_at TEXT,
+    registered_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE (specimen_id, evidence_kind, content_sha256)
+);
+
+-- 每个标本的版本化鉴定稿；部分唯一索引保证至多一个草稿/一个当前有效版本。
+CREATE TABLE IF NOT EXISTS determination_versions (
+    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    specimen_id TEXT NOT NULL REFERENCES specimens(specimen_id),
+    version_no INTEGER NOT NULL CHECK (version_no > 0),
+    scientific_name TEXT NOT NULL,
+    authorship TEXT,
+    rationale TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    -- draft：会签中或待发布；published：当前有效；rejected：终审驳回；superseded：被新版本接替；invalidated：证据变动失效
+    status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'rejected', 'superseded', 'invalidated')),
+    invalidation_reason TEXT,
+    invalidated_at TEXT,
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    UNIQUE (specimen_id, version_no)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_draft_determination_per_specimen
+ON determination_versions(specimen_id)
+WHERE status = 'draft';
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_current_determination_per_specimen
+ON determination_versions(specimen_id)
+WHERE status = 'published';
+
+-- 建稿时固化的证据引用快照，永不更新或删除（失效证据保留并标注状态）。
+CREATE TABLE IF NOT EXISTS determination_evidence_refs (
+    ref_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES determination_versions(version_id),
+    evidence_id TEXT NOT NULL,
+    evidence_kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    analysis_sha256 TEXT,
+    captured_status TEXT NOT NULL CHECK (captured_status IN ('active', 'withdrawn')),
+    created_at TEXT NOT NULL,
+    UNIQUE (version_id, evidence_id)
+);
+
+-- 顺序会签：initial_review -> specialist_review -> final_review。
+CREATE TABLE IF NOT EXISTS determination_signoffs (
+    signoff_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES determination_versions(version_id),
+    stage TEXT NOT NULL CHECK (stage IN ('initial_review', 'specialist_review', 'final_review')),
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    reviewer_id TEXT NOT NULL REFERENCES users(user_id),
+    comment TEXT NOT NULL,
+    signed_at TEXT NOT NULL,
+    UNIQUE (version_id, stage)
+);
+
+CREATE TABLE IF NOT EXISTS determination_reviewers (
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    stage TEXT NOT NULL CHECK (stage IN ('initial_review', 'specialist_review', 'final_review')),
+    assigned_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, stage)
+);
+
+-- 利益回避：登记后该用户不得会签对应标本的鉴定稿。
+CREATE TABLE IF NOT EXISTS reviewer_conflicts (
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    specimen_id TEXT NOT NULL REFERENCES specimens(specimen_id),
+    reason TEXT NOT NULL,
+    declared_by TEXT NOT NULL REFERENCES users(user_id),
+    declared_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, specimen_id)
+);
+
+-- 已裁定的学名归属：同一学名只能指向一个标本，供发布前冲突检查。
+CREATE TABLE IF NOT EXISTS taxon_name_rulings (
+    scientific_name TEXT PRIMARY KEY,
+    specimen_id TEXT NOT NULL REFERENCES specimens(specimen_id),
+    version_id INTEGER NOT NULL REFERENCES determination_versions(version_id),
+    ruled_at TEXT NOT NULL
+);
 """
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "evidence_protocol_catalog", "users", "capture_devices", "builds", "batches",
     "evidence_items", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
+    "specimens", "specimen_evidence", "determination_versions", "determination_evidence_refs",
+    "determination_signoffs", "determination_reviewers", "reviewer_conflicts", "taxon_name_rulings",
 })
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
     """打开连接并启用严格的事务与外键设置。"""
 
-    connection = sqlite3.connect(str(path), isolation_level=None)
+    connection = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
+    # 多线程 HTTP 服务共享连接：写操作一律 BEGIN IMMEDIATE，配合 busy_timeout 串行化；
+    # JsonApplication 另以锁保证同一时刻只有一个请求使用该连接。
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")

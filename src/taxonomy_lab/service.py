@@ -11,19 +11,37 @@ from typing import Any, Iterable, Mapping
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import EvidenceItem, EvidenceProtocol, ValidationError
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, NotFound, PublicationBlocked, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
 
+
+REVIEW_STAGES = ("initial_review", "specialist_review", "final_review")
+STAGE_ROLE = {
+    "initial_review": "initial_reviewer",
+    "specialist_review": "specialist_reviewer",
+    "final_review": "final_reviewer",
+}
+ROLE_STAGE = {role: stage for stage, role in STAGE_ROLE.items()}
+SPECIMEN_EVIDENCE_KINDS = ("initial_identification", "molecular_batch", "type_photograph")
 
 ROLE_PERMISSIONS = {
     "operator": {
         "catalog.write", "batch.create", "batch.start", "evidence_item.import",
         "exclusion.request", "exclusion.revoke",
+        "specimen.register", "specimen_evidence.write", "determination.create",
     },
-    "statistician": {"evidence_protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
-    "approver": {"decision.write"},
-    "auditor": {"report.read", "audit.read"},
+    "statistician": {
+        "evidence_protocol.publish", "batch.seal", "exclusion.review", "analysis.run",
+        "determination.read",
+    },
+    "approver": {
+        "decision.write", "reviewer.assign", "conflict.declare", "determination.read",
+    },
+    "auditor": {"report.read", "audit.read", "determination.read"},
+    "initial_reviewer": {"determination.sign.initial", "determination.read", "conflict.declare"},
+    "specialist_reviewer": {"determination.sign.specialist", "determination.read", "conflict.declare"},
+    "final_reviewer": {"determination.sign.final", "determination.read", "conflict.declare"},
 }
 
 
@@ -514,9 +532,456 @@ class TaxonomyLabService:
             raise Conflict("该分析版本已经形成决定") from exc
         return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision}
 
+    # ------------------------------------------------------------------
+    # 标本登记与证据
+    # ------------------------------------------------------------------
+
+    def register_specimen(
+        self, actor_id: str, specimen_id: str, catalog_code: str, taxon_group: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "specimen.register")
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO specimens(specimen_id,catalog_code,taxon_group,registered_by,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (specimen_id, catalog_code, taxon_group, actor_id, self._now()),
+                )
+                self._audit("specimen", specimen_id, "specimen.registered", actor_id, {"catalog_code": catalog_code})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("标本编号或馆藏目录号已存在") from exc
+        return {"specimen_id": specimen_id, "catalog_code": catalog_code, "taxon_group": taxon_group}
+
+    def _get_specimen(self, specimen_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM specimens WHERE specimen_id=?", (specimen_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("标本不存在")
+        return row
+
+    def register_specimen_evidence(
+        self,
+        actor_id: str,
+        evidence_id: str,
+        specimen_id: str,
+        evidence_kind: str,
+        title: str,
+        content_sha256: str,
+        provided_by: str,
+        analysis_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "specimen_evidence.write")
+        if evidence_kind not in SPECIMEN_EVIDENCE_KINDS:
+            raise ValidationFailed("证据类型必须是 initial_identification、molecular_batch 或 type_photograph")
+        if len(content_sha256) != 64:
+            raise ValidationFailed("证据摘要必须是 64 位 SHA-256")
+        if analysis_sha256 is not None and len(analysis_sha256) != 64:
+            raise ValidationFailed("分析批次摘要必须是 64 位 SHA-256")
+        self._get_specimen(specimen_id)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO specimen_evidence(evidence_id,specimen_id,evidence_kind,title,"
+                    "analysis_sha256,provided_by,content_sha256,status,registered_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,'active',?,?)",
+                    (evidence_id, specimen_id, evidence_kind, title, analysis_sha256,
+                     provided_by, content_sha256, actor_id, self._now()),
+                )
+                # 新增材料后，基于旧证据集合形成的当前有效结论失效，必须重走会签。
+                invalidated = self._invalidate_published_for_specimen(
+                    actor_id, specimen_id, f"标本新增材料 {evidence_id}（{evidence_kind}），原结论需重新评估"
+                )
+                self._audit("specimen_evidence", evidence_id, "specimen_evidence.registered", actor_id,
+                            {"specimen_id": specimen_id, "evidence_kind": evidence_kind,
+                             "invalidated_versions": invalidated})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("证据编号冲突或同内容证据已登记") from exc
+        return {"evidence_id": evidence_id, "specimen_id": specimen_id, "status": "active",
+                "invalidated_versions": invalidated}
+
+    def withdraw_specimen_evidence(
+        self, actor_id: str, evidence_id: str, reason: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "specimen_evidence.write")
+        if not reason.strip():
+            raise ValidationFailed("撤回原因不能为空")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT * FROM specimen_evidence WHERE evidence_id=?", (evidence_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("证据不存在")
+            if row["status"] != "active":
+                raise InvalidState("证据已经撤回")
+            cursor = self.connection.execute(
+                "UPDATE specimen_evidence SET status='withdrawn',withdrawn_reason=?,withdrawn_by=?,withdrawn_at=? "
+                "WHERE evidence_id=? AND status='active'",
+                (reason, actor_id, self._now(), evidence_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("证据状态已变化")
+            invalidated = self._invalidate_versions_for_evidence(
+                actor_id, evidence_id, f"引用证据 {evidence_id} 已撤回：{reason}"
+            )
+            self._audit("specimen_evidence", evidence_id, "specimen_evidence.withdrawn", actor_id,
+                        {"reason": reason, "invalidated_versions": invalidated})
+        return {"evidence_id": evidence_id, "status": "withdrawn"}
+
+    # ------------------------------------------------------------------
+    # 复核人员指派与利益回避
+    # ------------------------------------------------------------------
+
+    def assign_reviewer(self, actor_id: str, user_id: str, stage: str) -> dict[str, Any]:
+        self._require(actor_id, "reviewer.assign")
+        if stage not in STAGE_ROLE:
+            raise ValidationFailed("会签环节必须是 initial_review、specialist_review 或 final_review")
+        user = self._user(user_id)
+        if user["role"] != STAGE_ROLE[stage]:
+            raise Forbidden(f"用户角色 {user['role']} 不匹配 {stage} 环节")
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO determination_reviewers(user_id,stage,assigned_at) VALUES(?,?,?) "
+                "ON CONFLICT(user_id,stage) DO UPDATE SET assigned_at=excluded.assigned_at",
+                (user_id, stage, self._now()),
+            )
+            self._audit("reviewer", user_id, "reviewer.assigned", actor_id, {"stage": stage})
+        return {"user_id": user_id, "stage": stage}
+
+    def declare_reviewer_conflict(
+        self, actor_id: str, user_id: str, specimen_id: str, reason: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "conflict.declare")
+        if not reason.strip():
+            raise ValidationFailed("利益回避原因不能为空")
+        self._get_specimen(specimen_id)
+        self._user(user_id)
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO reviewer_conflicts(user_id,specimen_id,reason,declared_by,declared_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(user_id,specimen_id) DO UPDATE SET "
+                "reason=excluded.reason,declared_by=excluded.declared_by,declared_at=excluded.declared_at",
+                (user_id, specimen_id, reason, actor_id, self._now()),
+            )
+            self._audit("reviewer_conflict", f"{user_id}:{specimen_id}", "reviewer_conflict.declared",
+                        actor_id, {"user_id": user_id, "specimen_id": specimen_id})
+        return {"user_id": user_id, "specimen_id": specimen_id, "declared": True}
+
+    # ------------------------------------------------------------------
+    # 版本化鉴定稿
+    # ------------------------------------------------------------------
+
+    def _next_version_no(self, specimen_id: str) -> int:
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(version_no),0)+1 FROM determination_versions WHERE specimen_id=?",
+            (specimen_id,),
+        ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _determination_content(
+        scientific_name: str, authorship: str | None, rationale: str, evidence_ids: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        return [
+            {"scientific_name": scientific_name, "authorship": authorship, "rationale": rationale},
+            {"evidence_ids": sorted(evidence_ids)},
+        ]
+
+    def create_determination(
+        self,
+        actor_id: str,
+        specimen_id: str,
+        scientific_name: str,
+        rationale: str,
+        evidence_ids: list[str],
+        authorship: str | None = None,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "determination.create")
+        scientific_name = scientific_name.strip()
+        rationale = rationale.strip()
+        if not scientific_name or not rationale:
+            raise ValidationFailed("学名与鉴定理由不能为空")
+        if not evidence_ids:
+            raise ValidationFailed("鉴定稿至少引用一条证据")
+        if len(set(evidence_ids)) != len(evidence_ids):
+            raise ValidationFailed("证据引用不能重复")
+        digest = content_digest(self._determination_content(
+            scientific_name, authorship, rationale, tuple(evidence_ids)
+        ))
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            self._get_specimen(specimen_id)
+            refs: list[sqlite3.Row] = []
+            for evidence_id in evidence_ids:
+                row = self.connection.execute(
+                    "SELECT * FROM specimen_evidence WHERE evidence_id=? AND specimen_id=?",
+                    (evidence_id, specimen_id),
+                ).fetchone()
+                if row is None:
+                    raise NotFound(f"证据不存在或不属于该标本: {evidence_id}")
+                refs.append(row)
+            if any(row["status"] != "active" for row in refs):
+                raise InvalidState("不能引用已撤回的证据")
+            existing_draft = self.connection.execute(
+                "SELECT version_id FROM determination_versions WHERE specimen_id=? AND status='draft'",
+                (specimen_id,),
+            ).fetchone()
+            if existing_draft is not None:
+                raise Conflict("该标本已有进行中的鉴定稿，请先完成或驳回")
+            version_no = self._next_version_no(specimen_id)
+            cursor = self.connection.execute(
+                "INSERT INTO determination_versions(specimen_id,version_no,scientific_name,authorship,"
+                "rationale,content_sha256,status,created_by,created_at) VALUES(?,?,?,?,?,?, 'draft',?,?)",
+                (specimen_id, version_no, scientific_name, authorship, rationale, digest, actor_id, now),
+            )
+            version_id = cursor.lastrowid
+            for row in refs:
+                self.connection.execute(
+                    "INSERT INTO determination_evidence_refs(version_id,evidence_id,evidence_kind,title,"
+                    "content_sha256,analysis_sha256,captured_status,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (version_id, row["evidence_id"], row["evidence_kind"], row["title"],
+                     row["content_sha256"], row["analysis_sha256"], row["status"], now),
+                )
+            self._audit("determination_version", str(version_id), "determination.created", actor_id,
+                        {"specimen_id": specimen_id, "version_no": version_no, "evidence_count": len(refs)})
+        return self.get_determination(specimen_id, version_id)
+
+    def _get_version(self, specimen_id: str, version_id: int) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM determination_versions WHERE version_id=? AND specimen_id=?",
+            (version_id, specimen_id),
+        ).fetchone()
+        if row is None:
+            raise NotFound("鉴定稿版本不存在")
+        return row
+
+    def _version_refs(self, version_id: int) -> list[sqlite3.Row]:
+        return list(self.connection.execute(
+            "SELECT * FROM determination_evidence_refs WHERE version_id=? ORDER BY ref_id",
+            (version_id,),
+        ))
+
+    def _version_signoffs(self, version_id: int) -> list[sqlite3.Row]:
+        return list(self.connection.execute(
+            "SELECT * FROM determination_signoffs WHERE version_id=? ORDER BY signoff_id",
+            (version_id,),
+        ))
+
+    def get_determination(self, specimen_id: str, version_id: int) -> dict[str, Any]:
+        self._get_specimen(specimen_id)
+        version = self._get_version(specimen_id, version_id)
+        return {
+            "version": dict(version),
+            "evidence_refs": [dict(row) for row in self._version_refs(version_id)],
+            "signoffs": [dict(row) for row in self._version_signoffs(version_id)],
+        }
+
+    def read_determination(self, actor_id: str, specimen_id: str, version_id: int) -> dict[str, Any]:
+        self._require(actor_id, "determination.read")
+        return self.get_determination(specimen_id, version_id)
+
+    def current_determination(self, specimen_id: str) -> dict[str, Any] | None:
+        """科普端：返回当前有效结论；无当前结论时返回 None。"""
+        self._get_specimen(specimen_id)
+        row = self.connection.execute(
+            "SELECT * FROM determination_versions WHERE specimen_id=? AND status='published'",
+            (specimen_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "specimen_id": specimen_id,
+            "version_no": row["version_no"],
+            "scientific_name": row["scientific_name"],
+            "authorship": row["authorship"],
+            "published_at": row["published_at"],
+            "evidence_refs": [
+                {"evidence_id": r["evidence_id"], "evidence_kind": r["evidence_kind"], "title": r["title"]}
+                for r in self._version_refs(row["version_id"])
+            ],
+        }
+
+    def determination_history(self, actor_id: str, specimen_id: str) -> dict[str, Any]:
+        """研究端：完整修订链、签署人与引用依据。"""
+        self._require(actor_id, "determination.read")
+        self._get_specimen(specimen_id)
+        versions = self.connection.execute(
+            "SELECT version_id FROM determination_versions WHERE specimen_id=? ORDER BY version_no",
+            (specimen_id,),
+        ).fetchall()
+        return {
+            "specimen_id": specimen_id,
+            "versions": [self.get_determination(specimen_id, row["version_id"]) for row in versions],
+        }
+
+    def _invalidate_published_for_specimen(
+        self, actor_id: str, specimen_id: str, reason: str
+    ) -> list[int]:
+        """新增材料时仅使当前有效（published）版本失效；草稿与历史版本不动。"""
+        invalidated: list[int] = []
+        rows = self.connection.execute(
+            "SELECT version_id FROM determination_versions WHERE specimen_id=? AND status='published'",
+            (specimen_id,),
+        ).fetchall()
+        now = self._now()
+        for row in rows:
+            self.connection.execute(
+                "UPDATE determination_versions SET status='invalidated',invalidation_reason=?,invalidated_at=? "
+                "WHERE version_id=? AND status='published'",
+                (reason, now, row["version_id"]),
+            )
+            self._audit("determination_version", str(row["version_id"]),
+                        "determination.invalidated", actor_id, {"reason": reason})
+            invalidated.append(row["version_id"])
+        return invalidated
+
+    def _invalidate_versions_for_evidence(
+        self, actor_id: str, evidence_id: str, reason: str
+    ) -> list[int]:
+        """使引用该证据的会签中/当前有效版本失效；已终结的历史版本保持原样。"""
+        invalidated: list[int] = []
+        rows = self.connection.execute(
+            "SELECT v.version_id FROM determination_versions v "
+            "JOIN determination_evidence_refs r ON r.version_id=v.version_id "
+            "WHERE r.evidence_id=? AND v.status IN ('draft','published')",
+            (evidence_id,),
+        ).fetchall()
+        now = self._now()
+        for row in rows:
+            cursor = self.connection.execute(
+                "UPDATE determination_versions SET status='invalidated',invalidation_reason=?,invalidated_at=? "
+                "WHERE version_id=? AND status IN ('draft','published')",
+                (reason, now, row["version_id"]),
+            )
+            if cursor.rowcount == 1:
+                self._audit("determination_version", str(row["version_id"]),
+                            "determination.invalidated", actor_id, {"reason": reason})
+                invalidated.append(row["version_id"])
+        return invalidated
+
+    def sign_determination(
+        self,
+        actor_id: str,
+        specimen_id: str,
+        version_id: int,
+        approve: bool,
+        comment: str,
+    ) -> dict[str, Any]:
+        user = self._user(actor_id)
+        stage = ROLE_STAGE.get(user["role"])
+        if stage is None:
+            raise Forbidden("当前角色不能会签鉴定稿")
+        self._require(actor_id, f"determination.sign.{stage.replace('_review', '')}")
+        if not comment.strip():
+            raise ValidationFailed("会签意见不能为空")
+        with transaction(self.connection, immediate=True):
+            version = self._get_version(specimen_id, version_id)
+            if version["status"] != "draft":
+                raise InvalidState(f"鉴定稿当前状态 {version['status']} 不接受会签")
+            assigned = self.connection.execute(
+                "SELECT 1 FROM determination_reviewers WHERE user_id=? AND stage=?",
+                (actor_id, stage),
+            ).fetchone()
+            if assigned is None:
+                raise Forbidden(f"用户未被指派为 {stage} 环节复核人")
+            conflict = self.connection.execute(
+                "SELECT reason FROM reviewer_conflicts WHERE user_id=? AND specimen_id=?",
+                (actor_id, specimen_id),
+            ).fetchone()
+            if conflict is not None:
+                raise Forbidden(f"存在利益回避，不得会签：{conflict['reason']}")
+            expected_index = REVIEW_STAGES.index(stage)
+            prior = self.connection.execute(
+                "SELECT stage,decision FROM determination_signoffs WHERE version_id=?",
+                (version_id,),
+            ).fetchall()
+            prior_by_stage = {row["stage"]: row["decision"] for row in prior}
+            for earlier in REVIEW_STAGES[:expected_index]:
+                if prior_by_stage.get(earlier) != "approved":
+                    raise InvalidState(f"必须先完成 {earlier} 环节的批准")
+            if stage in prior_by_stage:
+                raise Conflict("该环节已经签署，重复签署不得生成第二份决定")
+            decision = "approved" if approve else "rejected"
+            now = self._now()
+            self.connection.execute(
+                "INSERT INTO determination_signoffs(version_id,stage,decision,reviewer_id,comment,signed_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (version_id, stage, decision, actor_id, comment, now),
+            )
+            self._audit("determination_version", str(version_id), f"determination.signed.{stage}", actor_id,
+                        {"decision": decision})
+            if not approve:
+                self.connection.execute(
+                    "UPDATE determination_versions SET status='rejected' WHERE version_id=? AND status='draft'",
+                    (version_id,),
+                )
+                self._audit("determination_version", str(version_id), "determination.rejected", actor_id,
+                            {"stage": stage})
+                return self.get_determination(specimen_id, version_id)
+            if stage == "final_review":
+                block_reasons = self._publication_block_reasons(specimen_id, version)
+                if block_reasons:
+                    raise PublicationBlocked(block_reasons)
+                self._publish(actor_id, specimen_id, version_id)
+        return self.get_determination(specimen_id, version_id)
+
+    def _publication_block_reasons(self, specimen_id: str, version: sqlite3.Row) -> list[str]:
+        reasons: list[str] = []
+        refs = self._version_refs(version["version_id"])
+        if not refs:
+            reasons.append("证据缺口：鉴定稿没有引用任何证据")
+        kinds = {ref["evidence_kind"] for ref in refs}
+        kind_labels = {
+            "initial_identification": "初鉴形态记录",
+            "molecular_batch": "分子分析批次",
+            "type_photograph": "模式照片",
+        }
+        for required in SPECIMEN_EVIDENCE_KINDS:
+            if required not in kinds:
+                reasons.append(f"证据缺口：缺少{kind_labels[required]}类证据")
+        withdrawn = [ref["evidence_id"] for ref in refs if ref["captured_status"] != "active"]
+        if withdrawn:
+            reasons.append(f"证据缺口：引用证据已撤回 {withdrawn}")
+        ruling = self.connection.execute(
+            "SELECT t.specimen_id FROM taxon_name_rulings t "
+            "JOIN determination_versions v ON v.version_id=t.version_id "
+            "WHERE t.scientific_name=? AND t.specimen_id<>? AND v.status='published'",
+            (version["scientific_name"], specimen_id),
+        ).fetchone()
+        if ruling is not None:
+            reasons.append(f"学名冲突：{version['scientific_name']} 当前归属标本 {ruling['specimen_id']}")
+        return reasons
+
+    def _publish(self, actor_id: str, specimen_id: str, version_id: int) -> None:
+        """在会签事务内发布：旧当前版本置为 superseded，写入学名裁定。"""
+        version = self._get_version(specimen_id, version_id)
+        now = self._now()
+        self.connection.execute(
+            "UPDATE determination_versions SET status='superseded' "
+            "WHERE specimen_id=? AND status='published'",
+            (specimen_id,),
+        )
+        cursor = self.connection.execute(
+            "UPDATE determination_versions SET status='published',published_at=? "
+            "WHERE version_id=? AND status='draft'",
+            (now, version_id),
+        )
+        if cursor.rowcount != 1:
+            raise InvalidState("鉴定稿状态已变化，无法发布")
+        self.connection.execute(
+            "INSERT INTO taxon_name_rulings(scientific_name,specimen_id,version_id,ruled_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(scientific_name) DO UPDATE SET "
+            "specimen_id=excluded.specimen_id,version_id=excluded.version_id,ruled_at=excluded.ruled_at",
+            (version["scientific_name"], specimen_id, version_id, now),
+        )
+        self._audit("determination_version", str(version_id), "determination.published", actor_id,
+                    {"scientific_name": version["scientific_name"]})
+
     def report(self, actor_id: str, batch_id: str) -> dict[str, Any]:
         user = self._user(actor_id)
-        if user["role"] not in {"statistician", "approver", "auditor"}:
+        if user["role"] not in {"statistician", "approver", "auditor",
+                                "initial_reviewer", "specialist_reviewer", "final_reviewer"}:
             raise Forbidden("当前角色不能读取完整报告")
         batch = self.get_batch(batch_id)
         evidence_protocol, evidence_protocol_digest = self._evidence_protocol(batch["evidence_protocol_id"], batch["evidence_protocol_version"])

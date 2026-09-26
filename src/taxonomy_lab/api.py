@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,8 @@ class JsonApplication:
 
     def __init__(self, service: TaxonomyLabService) -> None:
         self.service = service
+        # 共享单连接时串行化全部请求；写事务本身也靠 BEGIN IMMEDIATE 串行。
+        self._lock = threading.RLock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -48,6 +51,12 @@ class JsonApplication:
         return value
 
     def handle(
+        self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
+    ) -> Response:
+        with self._lock:
+            return self._handle(method, target, headers, body)
+
+    def _handle(
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
@@ -133,9 +142,78 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            # ---- 版本化鉴定稿 -------------------------------------------------
+            if method == "POST" and path == "/specimens":
+                result = self.service.register_specimen(
+                    self._actor(normalized_headers), payload["specimen_id"],
+                    payload["catalog_code"], payload["taxon_group"],
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "specimens" and parts[2] == "evidence":
+                result = self.service.register_specimen_evidence(
+                    self._actor(normalized_headers), payload["evidence_id"], parts[1],
+                    payload["evidence_kind"], payload["title"], payload["content_sha256"],
+                    payload["provided_by"], payload.get("analysis_sha256"),
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "specimen_evidence" and parts[2] == "withdraw":
+                result = self.service.withdraw_specimen_evidence(
+                    self._actor(normalized_headers), parts[1], payload["reason"]
+                )
+                return Response(200, result)
+            if method == "POST" and path == "/reviewers/assign":
+                result = self.service.assign_reviewer(
+                    self._actor(normalized_headers), payload["user_id"], payload["stage"]
+                )
+                return Response(200, result)
+            if method == "POST" and path == "/reviewer_conflicts":
+                result = self.service.declare_reviewer_conflict(
+                    self._actor(normalized_headers), payload["user_id"],
+                    payload["specimen_id"], payload["reason"],
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "specimens" and parts[2] == "determinations":
+                result = self.service.create_determination(
+                    self._actor(normalized_headers), parts[1], payload["scientific_name"],
+                    payload["rationale"], list(payload["evidence_ids"]),
+                    payload.get("authorship"),
+                )
+                return Response(201, result)
+            if (
+                method == "POST" and len(parts) == 5 and parts[0] == "specimens"
+                and parts[2] == "determinations" and parts[4] == "sign"
+            ):
+                result = self.service.sign_determination(
+                    self._actor(normalized_headers), parts[1], int(parts[3]),
+                    bool(payload["approve"]), payload.get("comment", ""),
+                )
+                return Response(200, result)
+            if (
+                method == "GET" and len(parts) == 4 and parts[0] == "specimens"
+                and parts[2] == "determination" and parts[3] == "current"
+            ):
+                # 科普端公共只读：当前有效结论
+                result = self.service.current_determination(parts[1])
+                if result is None:
+                    return Response(404, {"error": {"code": "no_current_determination",
+                                                   "message": "该标本暂无当前有效鉴定结论"}})
+                return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "specimens" and parts[2] == "determinations":
+                # 研究端：完整修订链
+                return Response(200, self.service.determination_history(self._actor(normalized_headers), parts[1]))
+            if (
+                method == "GET" and len(parts) == 4 and parts[0] == "specimens"
+                and parts[2] == "determinations"
+            ):
+                return Response(200, self.service.read_determination(
+                    self._actor(normalized_headers), parts[1], int(parts[3])))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error = {"code": exc.code, "message": str(exc)}
+            reasons = getattr(exc, "reasons", None)
+            if reasons:
+                error["reasons"] = list(reasons)
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
